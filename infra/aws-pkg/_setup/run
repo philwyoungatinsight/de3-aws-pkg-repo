@@ -1,0 +1,83 @@
+#!/bin/bash
+# aws-pkg setup — installs the AWS CLI (default, no args).
+# For seed/login/test/status/clean operations, delegates to ./seed.
+# Idempotent: checks whether the tool is already present before installing.
+# Supports macOS (Homebrew), Debian/Ubuntu (apt), and Fedora/RHEL (dnf).
+
+set -euo pipefail
+
+function handle_error {
+    local exit_status=$?
+    echo "An error occurred on line ${LINENO:-not-defined}: ${BASH_COMMAND:-not-defined}"
+    exit $exit_status
+}
+trap handle_error ERR
+
+GIT_ROOT="$(git rev-parse --show-toplevel)"
+. "$GIT_ROOT/set_env.sh"
+
+# ── helpers ────────────────────────────────────────────────────────────────────
+
+_arch() {
+    local a
+    a="$(uname -m)"
+    case "$a" in
+        x86_64)          echo "x86_64" ;;
+        aarch64 | arm64) echo "aarch64" ;;
+        *)               echo "$a" ;;
+    esac
+}
+
+_is_debian() {
+    [ -f /etc/debian_version ]
+}
+
+_has_brew() {
+    command -v brew >/dev/null 2>&1
+}
+
+_has_dnf() {
+    command -v dnf >/dev/null 2>&1
+}
+
+# ── AWS CLI v2 ────────────────────────────────────────────────────────────────
+# https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html
+_setup_aws_cli() {
+    if command -v aws >/dev/null 2>&1; then
+        echo "  aws: $(aws --version 2>&1 | head -1)"
+        return
+    fi
+    echo "==> Installing AWS CLI v2..."
+    if _has_brew; then
+        brew install awscli
+    elif _is_debian || _has_dnf; then
+        # Official Linux installer (works on any distro — no package manager needed)
+        local arch
+        arch="$(_arch)"
+        local zip="awscliv2.zip"
+        curl -fsSL -o "/tmp/${zip}" \
+            "https://awscli.amazonaws.com/awscli-exe-linux-${arch}.zip"
+        unzip -q -o "/tmp/${zip}" -d /tmp/awscli-install
+        sudo /tmp/awscli-install/aws/install --update
+        rm -rf "/tmp/${zip}" /tmp/awscli-install
+    else
+        echo "ERROR: unsupported platform for automatic AWS CLI install." >&2
+        echo "       Install manually: https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html" >&2
+        exit 1
+    fi
+    echo "  aws installed: $(aws --version 2>&1 | head -1)"
+}
+
+_install_tools() {
+    echo "=== aws-pkg setup ==="
+    _setup_aws_cli
+    echo "=== aws-pkg setup complete ==="
+}
+
+# ── dispatcher ────────────────────────────────────────────────────────────────
+
+if [ $# -eq 0 ]; then
+    _install_tools
+else
+    exec "$(dirname "$0")/seed" "$@"
+fi

@@ -1,0 +1,377 @@
+#!/usr/bin/env bash
+# aws-pkg seed — provisions/tears down cloud seed resources (IAM user, S3 state bucket).
+# Idempotent: checks whether each resource is present before creating it.
+
+set -euo pipefail
+
+function handle_error {
+    local exit_status=$?
+    echo "An error occurred on line ${LINENO:-not-defined}: ${BASH_COMMAND:-not-defined}"
+    exit $exit_status
+}
+trap handle_error ERR
+
+GIT_ROOT="$(git rev-parse --show-toplevel)"
+. "$GIT_ROOT/set_env.sh"
+
+. "$_UTILITIES_DIR/bash/framework-utils.sh"
+
+# ── seed config loading ────────────────────────────────────────────────────────
+
+_load_seed_config() {
+    COMP_NAME='aws-pkg'
+
+    COMPONENT_CONF=$(_find_component_config "$COMP_NAME") || exit 1
+
+    REQUIRED_ACCOUNT_ID=$(yq -r '."aws-pkg".seed.aws_account_id' "$COMPONENT_CONF")
+    TF_STATE_BUCKET=$(yq -r '."aws-pkg".seed.state_bucket' "$COMPONENT_CONF")
+    REGION=$(yq -r '."aws-pkg".seed.region // "us-east-1"' "$COMPONENT_CONF")
+
+    COMPONENT_SECRETS_CONF=$(_find_component_config "${COMP_NAME}_secrets") || exit 1
+
+    COMPONENT_SECRETS=$(sops -d "$COMPONENT_SECRETS_CONF")
+    _tmp=$(echo "$COMPONENT_SECRETS" | yq -r '."aws-pkg_secrets".seed.profile_name // ""')
+    AWS_PROFILE_NAME="${_tmp:-$TF_STATE_BUCKET}"
+    _tmp=$(echo "$COMPONENT_SECRETS" | yq -r '."aws-pkg_secrets".seed.iam_user_name // ""')
+    IAM_USER_NAME="${_tmp:-$TF_STATE_BUCKET}"
+    USER_POLICY_JSON=$(echo "$COMPONENT_SECRETS" | yq -r '."aws-pkg_secrets".seed.user_policy_json')
+
+    export KEY_DIR="$_CONFIG_TMP_DIR/seed/aws/aws-credentials"
+    export KEY_FILE="$KEY_DIR/tf-user-keys.json"
+
+    BIN_DIR="$HOME/bin-local"
+
+    SEP='################################################################################'
+}
+
+# ── seed helper functions ─────────────────────────────────────────────────────
+
+# Find the AWS package SOPS secrets file.
+_sops_lab_stack_secrets_file() {
+    echo "${_INFRA_DIR}/aws-pkg/_config/aws-pkg_secrets.sops.yaml"
+}
+
+# Validate the access key in KEY_FILE by calling STS directly with the raw keys.
+# Does not rely on the ~/.aws/credentials profile being configured yet.
+# Returns 0 if valid, 1 if the key is missing, deleted, or inactive.
+_access_key_valid() {
+    local key_id secret
+    key_id=$(jq -r '.AccessKey.AccessKeyId // empty' "$KEY_FILE" 2>/dev/null || true)
+    secret=$(jq -r '.AccessKey.SecretAccessKey // empty' "$KEY_FILE" 2>/dev/null || true)
+    [ -z "$key_id" ] || [ -z "$secret" ] && return 1
+    AWS_ACCESS_KEY_ID="$key_id" AWS_SECRET_ACCESS_KEY="$secret" \
+        aws sts get-caller-identity --region "$REGION" &>/dev/null
+}
+
+# Write access key credentials from KEY_FILE into SOPS under providers.aws.
+# Keeps SOPS as the single source of truth so keys are recoverable if KEY_FILE
+# is lost, and the "keys" auth_method works without local ~/.aws/credentials.
+_write_credentials_to_sops() {
+    local key_id secret
+    key_id=$(jq -r '.AccessKey.AccessKeyId' "$KEY_FILE")
+    secret=$(jq -r '.AccessKey.SecretAccessKey' "$KEY_FILE")
+    "$_CONFIG_MGR" set-raw aws-pkg aws-pkg_secrets.providers.aws.access_key_id "$key_id" --sops
+    "$_CONFIG_MGR" set-raw aws-pkg aws-pkg_secrets.providers.aws.secret_access_key "$secret" --sops
+    echo "  ✅ SOPS secrets synced (access_key_id: $key_id)."
+}
+
+# Blank AWS credentials in SOPS (called from _clean_all_aws).
+_clear_credentials_from_sops() {
+    "$_CONFIG_MGR" set-raw aws-pkg aws-pkg_secrets.providers.aws.access_key_id '""' --sops 2>/dev/null || true
+    "$_CONFIG_MGR" set-raw aws-pkg aws-pkg_secrets.providers.aws.secret_access_key '""' --sops 2>/dev/null || true
+    echo "✅ SOPS AWS credentials cleared."
+}
+
+# Remove the seed AWS profile from ~/.aws/credentials (called from _clean_all_aws).
+_clear_aws_profile() {
+    if [ ! -f "$HOME/.aws/credentials" ]; then return 0; fi
+    python3 - "$AWS_PROFILE_NAME" "$HOME/.aws/credentials" <<'PYEOF'
+import configparser, sys, os
+profile, creds_file = sys.argv[1], sys.argv[2]
+cfg = configparser.ConfigParser()
+cfg.read(creds_file)
+if cfg.has_section(profile):
+    cfg.remove_section(profile)
+    with open(creds_file, 'w') as f:
+        cfg.write(f)
+    print(f"✅ AWS profile '{profile}' removed from ~/.aws/credentials.")
+else:
+    print(f"✅ AWS profile '{profile}' not present in ~/.aws/credentials. Skipping.")
+PYEOF
+}
+
+# Delete all existing access keys for the IAM user (IAM limit: 2 per user),
+# create a fresh key, write KEY_FILE, configure the AWS profile, and sync SOPS.
+_create_access_key() {
+    mkdir -p "$KEY_DIR" && chmod 700 "$KEY_DIR"
+
+    local existing_keys
+    existing_keys=$(aws iam list-access-keys --user-name "$IAM_USER_NAME" \
+        --query 'AccessKeyMetadata[].AccessKeyId' --output text 2>/dev/null || true)
+    for akid in $existing_keys; do
+        [ -z "$akid" ] && continue
+        echo "  Deleting stale access key: $akid"
+        aws iam delete-access-key --user-name "$IAM_USER_NAME" --access-key-id "$akid"
+    done
+
+    echo "  Creating new access key for $IAM_USER_NAME..."
+    aws iam create-access-key --user-name "$IAM_USER_NAME" --output json > "$KEY_FILE"
+    chmod 600 "$KEY_FILE"
+    aws-import-key "$AWS_PROFILE_NAME" "$KEY_FILE"
+    _write_credentials_to_sops
+}
+
+check_account() {
+    echo "Verifying AWS Account Identity..."
+    if ! command -v aws &> /dev/null; then _install_cli_tools; fi
+
+    CURRENT_ACCOUNT_ID=$(aws sts get-caller-identity --query "Account" --output text)
+
+    if [ "$CURRENT_ACCOUNT_ID" != "$REQUIRED_ACCOUNT_ID" ]; then
+        echo "❌ ACCOUNT MISMATCH: Session is $CURRENT_ACCOUNT_ID, but Config requires $REQUIRED_ACCOUNT_ID"
+        exit 1
+    fi
+    echo "✅ Account Verified: $CURRENT_ACCOUNT_ID"
+}
+
+_install_cli_tools() {
+    echo "Verifying local toolchain..."
+    mkdir -p "$BIN_DIR"
+    if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then export PATH="$BIN_DIR:$PATH"; fi
+
+    # aws-cli (AWS Cloud CLI)
+    if ! command -v aws &> /dev/null; then
+        echo "Installing AWS CLI..."
+        curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+        unzip -q awscliv2.zip
+        ./aws/install -i "$BIN_DIR/aws-cli" -b "$BIN_DIR"
+        rm -rf aws awscliv2.zip
+    fi
+
+    # Tofu
+    LATEST_TOFU=$(curl -s https://api.github.com/repos/opentofu/opentofu/releases/latest | jq -r .tag_name | sed 's/^v//')
+    CURRENT_TOFU=$([[ -x $(command -v tofu) ]] && tofu version --json | jq -r .terraform_version || echo "none")
+    if [ "$LATEST_TOFU" != "$CURRENT_TOFU" ]; then
+        echo "Updating OpenTofu: $CURRENT_TOFU -> $LATEST_TOFU"
+        curl -LO "https://github.com/opentofu/opentofu/releases/download/v${LATEST_TOFU}/tofu_${LATEST_TOFU}_linux_amd64.zip"
+        unzip -o "tofu_${LATEST_TOFU}_linux_amd64.zip" tofu
+        mv tofu "$BIN_DIR/"
+        rm "tofu_${LATEST_TOFU}_linux_amd64.zip"
+    else
+        echo "✅ OpenTofu is up to date ($CURRENT_TOFU)."
+    fi
+
+    # Terragrunt
+    LATEST_TG=$(curl -s https://api.github.com/repos/gruntwork-io/terragrunt/releases/latest | jq -r .tag_name)
+    if [[ "$([[ -x $(command -v terragrunt) ]] && terragrunt --version | awk '{print $3}' || echo "")" != "$LATEST_TG" ]]; then
+        curl -Lo "$BIN_DIR/terragrunt" "https://github.com/gruntwork-io/terragrunt/releases/download/${LATEST_TG}/terragrunt_linux_amd64"
+        chmod +x "$BIN_DIR/terragrunt"
+    fi
+
+    aws organizations list-accounts --no-cli-pager
+}
+
+# Import keys for an IAM user created like this:
+#     aws iam create-access-key --user-name "$IAM_USER_NAME" --output json > "$KEY_FILE"
+aws-import-key() {
+    local PROFILE=$1
+    local FILE=$2
+
+    # Extract keys using jq
+    local ACCESS_KEY=$(jq -r '.AccessKey.AccessKeyId' "$FILE")
+    local SECRET_KEY=$(jq -r '.AccessKey.SecretAccessKey' "$FILE")
+
+    # Validate jq output
+    if [[ "$ACCESS_KEY" == "null" || "$SECRET_KEY" == "null" ]]; then
+        echo "Error: Could not parse keys from $FILE. Ensure it is the valid AWS JSON output."
+        return 1
+    fi
+
+    # Configure the specific profile
+    aws configure set aws_access_key_id "$ACCESS_KEY" --profile "$PROFILE"
+    aws configure set aws_secret_access_key "$SECRET_KEY" --profile "$PROFILE"
+
+    echo "✅ Success! Profile '$PROFILE' is now configured."
+    echo "Test it with: aws sts get-caller-identity --profile $PROFILE"
+}
+
+_seed_aws() {
+    check_account
+    echo "Syncing AWS Seed Resources..."
+
+    # 1. IAM User Creation & Inline Policy Assignment
+    if ! aws iam get-user --user-name "$IAM_USER_NAME" &>/dev/null; then
+        echo "Creating IAM User: $IAM_USER_NAME..."
+        aws iam create-user --user-name "$IAM_USER_NAME"
+
+        echo "Applying inline policy: $IAM_USER_NAME"
+        aws iam put-user-policy \
+            --user-name "$IAM_USER_NAME" \
+            --policy-name "$IAM_USER_NAME" \
+            --policy-document "$USER_POLICY_JSON"
+    else
+        echo "✅ IAM User $IAM_USER_NAME already exists."
+    fi
+
+    # 2. Access Key Creation
+    mkdir -p "$KEY_DIR" && chmod 700 "$KEY_DIR"
+    if [ ! -f "$KEY_FILE" ]; then
+        echo "Access key file missing — creating new access key..."
+        _create_access_key
+    elif ! _access_key_valid; then
+        echo "⚠️  Access key in $KEY_FILE is invalid or deleted in AWS — recreating..."
+        _create_access_key
+    else
+        echo "✅ Access key is valid."
+        # Ensure SOPS is in sync with the current KEY_FILE
+        local sops_file key_id sops_key_id
+        sops_file=$(_sops_lab_stack_secrets_file)
+        key_id=$(jq -r '.AccessKey.AccessKeyId' "$KEY_FILE")
+        if [ -n "$sops_file" ]; then
+            sops_key_id=$(SOPS_AGE_KEY_FILE="$HOME/.sops/age/keys.txt" sops -d "$sops_file" 2>/dev/null \
+                | yq -r '.["aws-pkg_secrets"].providers.aws.access_key_id // ""')
+            if [ "$sops_key_id" != "$key_id" ]; then
+                echo "  SOPS access_key_id mismatch — syncing..."
+                _write_credentials_to_sops
+            else
+                echo "  ✅ SOPS already in sync (access_key_id: $key_id)."
+            fi
+        fi
+        aws-import-key "$AWS_PROFILE_NAME" "$KEY_FILE"
+    fi
+
+    # 3. S3 Bucket for State
+    if ! aws s3api head-bucket --bucket "$TF_STATE_BUCKET" 2>/dev/null; then
+        echo "Creating S3 Bucket: $TF_STATE_BUCKET"
+        aws s3api create-bucket --bucket "$TF_STATE_BUCKET" --region "$REGION" \
+            $( [[ "$REGION" != "us-east-1" ]] && echo "--create-bucket-configuration LocationConstraint=$REGION" )
+
+        aws s3api put-bucket-versioning --bucket "$TF_STATE_BUCKET" --versioning-configuration Status=Enabled
+        aws s3api put-bucket-encryption --bucket "$TF_STATE_BUCKET" \
+            --server-side-encryption-configuration '{"Rules": [{"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "AES256"}}]}'
+    else
+        echo "✅ S3 Bucket $TF_STATE_BUCKET already exists."
+    fi
+}
+
+_test_aws() {
+    check_account
+    echo "Running connectivity test to S3..."
+    echo "test-data-$(date)" > connection-test.tmp
+    aws s3 cp connection-test.tmp "s3://$TF_STATE_BUCKET/test-connection.txt"
+    aws s3 rm "s3://$TF_STATE_BUCKET/test-connection.txt"
+    rm connection-test.tmp
+    echo "✅ S3 Read/Write Verified."
+}
+
+_clean_aws() {
+    echo "Wiping local master key file..."
+    rm -rf "$KEY_DIR"
+    echo "✅ Local credentials removed."
+}
+
+_clean_all_aws() {
+    check_account
+
+    echo "$SEP"
+    echo "DANGER: Destructive Deletion of AWS Seed Resources"
+    echo "Target Account: $REQUIRED_ACCOUNT_ID"
+    echo "$SEP"
+
+    read -p "Type the Account ID ($REQUIRED_ACCOUNT_ID) to confirm deletion: " CONFIRM_ID
+    if [[ "$CONFIRM_ID" == "$REQUIRED_ACCOUNT_ID" ]]; then
+
+        # Idempotent S3 Deletion
+        if aws s3api head-bucket --bucket "$TF_STATE_BUCKET" 2>/dev/null; then
+            echo "Emptying S3 Bucket (all versions and delete markers)..."
+            for type in "Versions" "DeleteMarkers"; do
+                items=$(aws s3api list-object-versions --bucket "$TF_STATE_BUCKET" --query "$type[].{Key:Key,VersionId:VersionId}" --output json)
+                if [ "$items" != "null" ] && [ "$items" != "[]" ]; then
+                    echo "Deleting $type..."
+                    echo "$items" | jq -c '.[]' | while read -r row; do
+                        aws s3api delete-object --bucket "$TF_STATE_BUCKET" --key $(echo "$row" | jq -r .Key) --version-id $(echo "$row" | jq -r .VersionId)
+                    done
+                fi
+            done
+            echo "Deleting S3 Bucket..."
+            aws s3api delete-bucket --bucket "$TF_STATE_BUCKET" --region "$REGION"
+        else
+            echo "✅ S3 Bucket $TF_STATE_BUCKET does not exist. Skipping."
+        fi
+
+        # Idempotent IAM Cleanup
+        if aws iam get-user --user-name "$IAM_USER_NAME" &>/dev/null; then
+            echo "Cleaning up IAM User..."
+            # Check for existing access keys
+            keys=$(aws iam list-access-keys --user-name "$IAM_USER_NAME" --query 'AccessKeyMetadata[].AccessKeyId' --output text)
+            for akid in $keys; do
+                echo "Deleting Access Key: $akid"
+                aws iam delete-access-key --user-name "$IAM_USER_NAME" --access-key-id "$akid"
+            done
+
+            # 1. Delete the inline policy
+            echo "Removing inline policy from: $IAM_USER_NAME..."
+            aws iam delete-user-policy \
+                --user-name "$IAM_USER_NAME" \
+                --policy-name "$IAM_USER_NAME"
+
+            # 2. Delete the IAM user
+            echo "Deleting IAM User: $IAM_USER_NAME..."
+            aws iam delete-user --user-name "$IAM_USER_NAME"
+        else
+            echo "✅ IAM User $IAM_USER_NAME does not exist. Skipping."
+        fi
+
+        _clear_credentials_from_sops
+        _clear_aws_profile
+        _clean_aws
+
+        echo "✅ AWS Resources and local credentials wiped."
+    else
+        echo "Confirmation failed. Aborting."
+        exit 1
+    fi
+}
+
+_status_aws() {
+    echo "$SEP"
+    echo "AWS STATUS"
+    echo "$SEP"
+    echo "Account:    $REQUIRED_ACCOUNT_ID"
+    echo "Bucket:     s3://$TF_STATE_BUCKET"
+    echo "Console:    https://$REGION.console.aws.amazon.com/s3/buckets/$TF_STATE_BUCKET"
+    echo ""
+    if command -v aws &>/dev/null; then
+        aws s3api get-bucket-versioning --bucket "$TF_STATE_BUCKET" 2>/dev/null || echo "Bucket not found."
+    fi
+}
+
+_login_aws() {
+    check_account || { aws configure; }
+}
+
+show_usage() {
+    printf "Usage: %s [command]\n" "$0"
+    cat <<EOF
+  --seed|-b     Provision AWS seed resources (IAM user, S3 state bucket)
+  --login|-l    Verify AWS credentials are valid (prompt aws configure if not)
+  --test|-t     Verify S3 bucket read/write access
+  --status|-S   Show AWS seed resource status
+  --clean       Remove local key file
+  --clean-all   DELETE key file, S3 bucket, and IAM user
+  --help|-h     Show this help
+EOF
+}
+
+# ── dispatcher ────────────────────────────────────────────────────────────────
+
+case "${1:-}" in
+    --seed|-b)    _load_seed_config; _seed_aws ;;
+    --login|-l)   _load_seed_config; _login_aws ;;
+    --test|-t)    _load_seed_config; _test_aws ;;
+    --status|-S)  _load_seed_config; _status_aws ;;
+    --clean)      _load_seed_config; _clean_aws ;;
+    --clean-all)  _load_seed_config; _clean_all_aws ;;
+    --help|-h)    show_usage ;;
+    *) echo "Usage: $0 <--seed|--login|--test|--status|--clean|--clean-all>" >&2; exit 1 ;;
+esac

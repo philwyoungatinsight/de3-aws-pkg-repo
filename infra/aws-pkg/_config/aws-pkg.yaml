@@ -1,0 +1,7 @@
+aws-pkg:
+  _provides_capability:
+  - aws-pkg: "1.0.0"
+  seed:
+    aws_account_id: ""
+    state_bucket: ""
+    region: "us-east-1"
