@@ -5,3 +5,40 @@ aws-pkg:
     aws_account_id: ""
     state_bucket: ""
     region: "us-east-1"
+
+  config_params:
+    # ---------------------------------------------------------------------------
+    # Example deployment — illustrates the required config structure.
+    # Copy to your deployment package (e.g. pwy-home-lab-pkg) and set real values.
+    # ---------------------------------------------------------------------------
+    aws-pkg/_stack/aws/examples-archive:
+      _env: example
+      _provider: aws
+      _skip_on_build: true
+      _region: us-east-1
+      project_prefix: example
+
+    aws-pkg/_stack/aws/examples-archive/example-lab/us-east-1/dev:
+      _env: dev
+      _provider_aws_auth_method: profile
+      _provider_aws_profile: my-aws-profile   # replace with real AWS profile name
+      _provider_aws_account_id: "123456789012"  # replace with real account ID
+      _region: us-east-1
+      _wave: cloud.storage
+      project_prefix: example
+
+    aws-pkg/_stack/aws/examples-archive/example-lab/us-east-1/dev/test-bucket:
+      _unit_purpose: >
+        Example S3 bucket. Copy to your deployment package and set a real bucket_name
+        (must be globally unique). force_destroy: true allows deletion even if non-empty.
+      _wave: cloud.storage
+      bucket_name: example-test-bucket-replace-me
+      force_destroy: true
+      versioning_enabled: false
+
+    aws-pkg/_stack/aws/examples-archive/example-lab/us-east-1/dev/test-bucket/all-config:
+      _unit_purpose: >
+        Example S3 object — uploads the merged stack config JSON to the bucket above.
+        Validates config export tooling on AWS.
+      _wave: cloud.storage
+      bucket_name: example-test-bucket-replace-me
